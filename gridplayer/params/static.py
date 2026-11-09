@@ -504,22 +504,42 @@ class VideoInitialState(AutoName):
 
 
 class VideoDriver(AutoName):
-    VLC_SW = auto()
-    VLC_SW_SP = auto()
-    VLC_HW = auto()
-    VLC_HW_SP = auto()
+    MPV_HW = auto()
+    MPV_SW = auto()
     DUMMY = auto()
 
+    @classmethod
+    def _missing_(cls, value):
+        # what settings saved before the move from VLC still say
+        if value in {"vlc_hw", "vlc_hw_sp"}:
+            return cls.MPV_HW
 
-class HWCropBorderOffset(AutoName):
+        if value in {"vlc_sw", "vlc_sw_sp"}:
+            return cls.MPV_SW
+
+        return None
+
+
+class VideoQuality(AutoName):
     AUTO = auto()
-    DISABLED = auto()
-    PX2 = auto()
-    PX4 = auto()
-    PX6 = auto()
-    PX8 = auto()
-    PX10 = auto()
-    PX12 = auto()
+    FAST = auto()
+    BALANCED = auto()
+    HIGH = auto()
+    MAXIMUM = auto()
+
+
+class HardwareDecoding(AutoName):
+    AUTO = auto()
+    COPY = auto()
+    OFF = auto()
+
+
+class GpuChoice:
+    """What the graphics card setting holds, besides the name of a card."""
+
+    AUTO = ""
+    HIGH_PERFORMANCE = "high_performance"
+    POWER_SAVING = "power_saving"
 
 
 class SeekSyncMode(AutoName):
@@ -619,6 +639,7 @@ class ColorScheme(AutoName):
     SYSTEM = auto()
     LIGHT = auto()
     DARK = auto()
+    TRUE_DARK = auto()
 
 
 class ScreenshotFormat(AutoName):

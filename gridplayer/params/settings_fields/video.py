@@ -71,9 +71,13 @@ VIDEO_FIELDS: tuple[SettingField, ...] = (
         settings_key="video_defaults/volume",
         label=translate("SettingsDialog", "Volume"),
         minimum=0,
-        maximum=1,
+        maximum=3,
         decimals=2,
         step=0.05,
+        tooltip=translate(
+            "SettingsDialog",
+            "1 is 100%. It stops at the Maximum volume set on the Player page.",
+        ),
     ),
     CheckboxField(
         settings_key="video_defaults/muted",
@@ -208,10 +212,8 @@ VIDEO_FIELDS: tuple[SettingField, ...] = (
         ),
         tooltip=translate(
             "SettingsDialog",
-            "Auto: VLC chooses (currently X).\n"
-            "Yadif (2x), Bob and Phosphor double the frame rate, which costs more"
-            " with many videos.\n"
-            "With hardware decoding, the GPU may use another mode it supports.",
+            "mpv picks the deinterlacer that suits the decoder itself, so this"
+            " choice has no effect yet.",
         ),
     ),
     ComboField(

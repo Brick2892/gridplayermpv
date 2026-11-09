@@ -8,7 +8,7 @@ from pathlib import Path
 from pydantic_extra_types.color import Color
 from PyQt5.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QCursor
-from PyQt5.QtWidgets import QStackedLayout, QWidget
+from PyQt5.QtWidgets import QApplication, QStackedLayout, QWidget
 
 from gridplayer.dialogs.input_dialog import (
     QCustomSpinboxTimeInput,
@@ -31,6 +31,15 @@ from gridplayer.models.video import (
     Video,
     VideoBlockMime,
 )
+from gridplayer.mpv_player.static import (
+    DISABLED_TRACK,
+    SEEK_ARRIVAL_MS,
+    MediaInput,
+    SeekLanding,
+    arriving_time,
+    is_loop_wrapped,
+    seek_landing,
+)
 from gridplayer.params import env
 from gridplayer.params.static import (
     MAX_RATE,
@@ -47,11 +56,6 @@ from gridplayer.params.static import (
 )
 from gridplayer.settings import Settings
 from gridplayer.utils.drop_zone import DropIndicator
-from gridplayer.utils.libvlc_options_parser import (
-    get_vlc_options,
-    is_deinterlace_reload_needed,
-    is_reopen_needed,
-)
 from gridplayer.utils.qt import MILLISECONDS, qt_connect, translate
 from gridplayer.utils.sponsorblock import (
     segment_mark,
@@ -59,15 +63,7 @@ from gridplayer.utils.sponsorblock import (
 from gridplayer.utils.step_sizes import seek_step_ms
 from gridplayer.utils.url_resolve.static import ResolvedVideo
 from gridplayer.utils.url_resolve.url_resolve import VideoURLResolver
-from gridplayer.vlc_player.static import (
-    DISABLED_TRACK,
-    SEEK_ARRIVAL_MS,
-    MediaInput,
-    SeekLanding,
-    arriving_time,
-    is_loop_wrapped,
-    seek_landing,
-)
+from gridplayer.utils.video_reopen import is_reopen_needed
 from gridplayer.widgets.cell_chrome import (
     chrome_color_on_cell,
     paint_idle_disc,
@@ -92,7 +88,7 @@ from gridplayer.widgets.video_block_status import StatusControl
 from gridplayer.widgets.video_block_stream import StreamControl
 from gridplayer.widgets.video_block_subtitles import SubtitleControl
 from gridplayer.widgets.video_block_view import ViewControl
-from gridplayer.widgets.video_frame_vlc_base import VideoFrameVLC
+from gridplayer.widgets.video_frame_base import VideoFrame
 from gridplayer.widgets.video_overlay import (
     OverlayBlock,
     OverlayBlockChild,
@@ -142,6 +138,7 @@ class VideoBlock(QWidget):
     sync_time = pyqtSignal(MILLISECONDS)
     # the others paused for a step to the next or the previous frame
     sync_paused = pyqtSignal(bool)
+    sync_scrubbing = pyqtSignal(bool)
     # what the viewer had this one do, for the others to follow where that
     # is synced: played or paused, zoomed or moved (a SyncedView), the speed
     sync_pause = pyqtSignal(bool)
@@ -152,6 +149,7 @@ class VideoBlock(QWidget):
 
     time_change = pyqtSignal(MILLISECONDS, MILLISECONDS)
     volume_change = pyqtSignal(float)
+    volume_full_mark_change = pyqtSignal(float)
     label_change = pyqtSignal(str)
     # the cell is closing, for a window open on it to close with it
     closing = pyqtSignal()
@@ -172,7 +170,7 @@ class VideoBlock(QWidget):
     picture_shape_change = pyqtSignal()
 
     # How wide the picture is for its height on screen, the last its video
-    # said (see VideoFrameVLC.picture_shape): kept through a reload, and
+    # said (see VideoFrame.picture_shape): kept through a reload, and
     # until the next video says, None before any has.
     picture_shape: float | None = None
 
@@ -207,6 +205,9 @@ class VideoBlock(QWidget):
 
         # last time update seen, to tell a finished pass from a running one
         self._last_time = None
+
+        # the timeline being dragged, here or where this one follows another
+        self._is_scrubbing = False
 
         # how long the site a URL resolved on says the video is, to know its
         # chapters and SponsorBlock's segments by; and the ID SponsorBlock
@@ -252,7 +253,7 @@ class VideoBlock(QWidget):
         # the seek before the last, when the last was made before it landed
         self._seek_behind: int | None = None
 
-        self.video_driver: VideoFrameVLC | None = None
+        self.video_driver: VideoFrame | None = None
 
         # before the resolver, which is wired to them as it is made
         self.status = StatusControl(self)
@@ -290,11 +291,8 @@ class VideoBlock(QWidget):
             cls = cls.func
         return bool(getattr(cls, "is_native_surface", False))
 
-    def init_video_driver(self) -> VideoFrameVLC:
-        vlc_options = get_vlc_options(self.video_params)
-        self._log.debug(f"vlc_options: {vlc_options}")
-
-        video_driver = self.video_driver_cls(vlc_options=vlc_options, parent=self)
+    def init_video_driver(self) -> VideoFrame:
+        video_driver = self.video_driver_cls(parent=self)
 
         qt_connect(
             (video_driver.video_ready, self.load_video_finish),
@@ -317,7 +315,7 @@ class VideoBlock(QWidget):
 
         return video_driver
 
-    def _ensure_video_driver(self) -> VideoFrameVLC:
+    def _ensure_video_driver(self) -> VideoFrame:
         if self.video_driver is not None:
             return self.video_driver
 
@@ -340,10 +338,8 @@ class VideoBlock(QWidget):
         if self.video_driver is None:
             return
 
-        # Don't hide VLC HW frame widget, otherwise first frame comes out glitchy and takes time to normalize
-        # Happens only on Windows
-        # Possibly related issue - short ~100-300ms "freeze-frame" lag before video starts actually playing
-        # especially noticeable on streaming vids, also happens on Linux
+        # The window mpv draws into has to stay up on Windows for the first
+        # frame to come out right.
         if env.IS_WINDOWS and self._driver_has_native_surface():
             return
 
@@ -455,7 +451,8 @@ class VideoBlock(QWidget):
 
         qt_connect(
             (overlay.set_vid_pos, partial(self.manual_seek, "seek_percent")),
-            (overlay.set_volume, self.audio.set_volume),
+            (overlay.scrub_changed, self._on_scrub_changed),
+            (overlay.set_volume, self.audio.set_volume_from_bar),
             (overlay.exit_clicked, self.close),
             (overlay.play_pause_clicked, self.play_pause),
             (overlay.mute_unmute_clicked, self.audio.mute_unmute),
@@ -480,6 +477,7 @@ class VideoBlock(QWidget):
             (overlay.details_clicked, self.status.show_error_details),
             (self.time_change, overlay.set_position),
             (self.volume_change, overlay.set_volume_position),
+            (self.volume_full_mark_change, overlay.set_volume_full_mark),
             (self.label_change, overlay.set_label),
             (self.list_place_change, overlay.set_list_place),
             (self.color_change, overlay.set_color),
@@ -550,12 +548,12 @@ class VideoBlock(QWidget):
 
         self._log.debug(f"{self.id}: cleaning up done")
 
-    def video_driver_error(self, error: str, vlc_lines: tuple[str, ...] = ()):
+    def video_driver_error(self, error: str, player_lines: tuple[str, ...] = ()):
         # marked for translation where the player process says it, which
         # has no translator of its own
         message = translate("Video Error", error)
 
-        self.status.last_error = self.status.player_error(message, vlc_lines)
+        self.status.last_error = self.status.player_error(message, player_lines)
         self.status.set_text(message)
 
         if not self.video_params.is_local_file:
@@ -1223,6 +1221,11 @@ class VideoBlock(QWidget):
         if self._ctx.is_drag_ui:
             return
 
+        # a bar still held: hidden, it would take the drag with it
+        if self.overlay.is_bar_held and QApplication.mouseButtons() & Qt.LeftButton:
+            self.overlay_hide_timer.start(1000 * self._ctx.overlay_timeout)
+            return
+
         # it shows a selection to zoom to, or how to make one
         if self.view.is_zoom_ui():
             return
@@ -1253,6 +1256,11 @@ class VideoBlock(QWidget):
             return
 
         if self.is_stopped:
+            return
+
+        # keyframes land short of where they were aimed, even outside a loop
+        # or at a wrap, and the drag's last seek will settle all that
+        if self._is_scrubbing:
             return
 
         # Where a seek has not got to yet says nothing about the loop. On a
@@ -1552,13 +1560,6 @@ class VideoBlock(QWidget):
             self._start_load()
             return
 
-        if self.video_tracks and is_deinterlace_reload_needed(
-            self.video_params, snapshot.deinterlace, snapshot.deinterlace_mode
-        ):
-            self._take_snapshot_params(snapshot)
-            self.reload()
-            return
-
         self.set_video_track(snapshot.video_track_id)
         self.audio.restore_selection(snapshot.audio_selection)
 
@@ -1619,16 +1620,7 @@ class VideoBlock(QWidget):
             self.video_params = new
             return
 
-        if (
-            is_reopen_needed(params, new)
-            or new.transform != params.transform
-            or (
-                self.video_tracks
-                and is_deinterlace_reload_needed(
-                    params, new.deinterlace, new.deinterlace_mode
-                )
-            )
-        ):
+        if is_reopen_needed(params, new):
             self.video_params = new
             self.reload()
             return
@@ -2009,17 +2001,10 @@ class VideoBlock(QWidget):
     def set_deinterlace_params(
         self, deinterlace: VideoDeinterlace, mode: VideoDeinterlaceMode
     ):
-        is_reload_needed = is_deinterlace_reload_needed(
-            self.video_params, deinterlace, mode
-        )
-
         self.video_params.deinterlace = deinterlace
         self.video_params.deinterlace_mode = mode
 
-        if is_reload_needed:
-            self.reload()
-        else:
-            self.video_driver.set_deinterlace(deinterlace, mode)
+        self.video_driver.set_deinterlace(deinterlace, mode)
 
     @property
     def seek_marks(self) -> tuple[SeekMark, ...]:
@@ -2183,7 +2168,22 @@ class VideoBlock(QWidget):
         self.sponsorblock.note_seek(seek_ms, is_viewers)
 
         self.time = seek_ms
-        self.video_driver.set_time(seek_ms)
+
+        if self._is_scrubbing and not self.stream.is_adaptive:
+            self.video_driver.set_time_keyframe(seek_ms)
+        else:
+            self.video_driver.set_time(seek_ms)
+
+    def _on_scrub_changed(self, is_scrubbing: bool):
+        self.set_scrubbing(is_scrubbing)
+        self.sync_scrubbing.emit(is_scrubbing)
+
+        # the moves of a drag stay with the bar, the timeout not having heard
+        if not is_scrubbing:
+            self.show_overlay()
+
+    def set_scrubbing(self, is_scrubbing: bool):
+        self._is_scrubbing = is_scrubbing and Settings().get("player/fast_scrubbing")
 
     @property
     def arriving_time(self) -> int:

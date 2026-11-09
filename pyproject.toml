@@ -14,7 +14,7 @@ license = "GPL-3.0-or-later"
 keywords = [
     "video",
     "player",
-    "vlc",
+    "mpv",
     "pyqt",
     "Qt5",
     "multimedia",
@@ -49,6 +49,7 @@ dependencies = [
     "winrt-Windows.Foundation (>=3.2.1,<4.0.0) ; sys_platform == 'win32'",
     "winrt-Windows.Media (>=3.2.1,<4.0.0) ; sys_platform == 'win32'",
     "winrt-Windows.Media.Playback (>=3.2.1,<4.0.0) ; sys_platform == 'win32'",
+    "mpv>=1.0.7",
 ]
 
 [project.urls]
@@ -75,13 +76,13 @@ module-root = ""
 
 [tool.pytest.ini_options]
 markers = [
-    "real_app: drives the real app with VLC and ffmpeg, see tests/real_app; run with -m real_app",
+    "real_app: drives the real app with mpv and ffmpeg, see tests/real_app; run with -m real_app",
+    "mpv: the player classes against the real libmpv, see tests/mpv_player; run with -m mpv",
 ]
 # a later -m on the command line takes over from this one
-addopts = "-m 'not real_app'"
+addopts = "-m 'not real_app and not mpv'"
 
 [tool.ruff]
-extend-exclude = ["gridplayer/vlc_player/vlc.py"]
 force-exclude = true
 
 [tool.ruff.format]

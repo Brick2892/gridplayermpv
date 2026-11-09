@@ -3,11 +3,11 @@ from abc import abstractmethod
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
+from gridplayer.mpv_player.static import Media, MediaInput
 from gridplayer.utils.qt import MILLISECONDS, QABC
-from gridplayer.vlc_player.static import Media, MediaInput
 
 
-class VLCVideoDriver(QObject, metaclass=QABC):
+class PlayerDriver(QObject, metaclass=QABC):
     time_changed = pyqtSignal(MILLISECONDS)
     playback_status_changed = pyqtSignal(int)
     load_finished = pyqtSignal(Media)
@@ -99,6 +99,11 @@ class VLCVideoDriver(QObject, metaclass=QABC):
     @abstractmethod
     def set_time(self, seek_ms): ...
 
+    def set_time_keyframe(self, seek_ms):
+        """A seek that may land short, for one that must be quick."""
+
+        self.set_time(seek_ms)
+
     @abstractmethod
     def set_playback_rate(self, rate): ...
 
@@ -138,8 +143,8 @@ class VLCVideoDriver(QObject, metaclass=QABC):
     @abstractmethod
     def set_subtitle_delay(self, delay_ms): ...
 
-    def error_state(self, error, vlc_lines=()):
-        self.error.emit(error, tuple(vlc_lines))
+    def error_state(self, error, player_lines=()):
+        self.error.emit(error, tuple(player_lines))
 
     def update_status_emit(self, status, percent):
         self.update_status.emit(status, percent)

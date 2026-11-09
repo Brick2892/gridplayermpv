@@ -31,8 +31,9 @@ from gridplayer.params.static import (
     CacheMode,
     ColorScheme,
     DropAction,
+    GpuChoice,
     GridMode,
-    HWCropBorderOffset,
+    HardwareDecoding,
     ListEndAction,
     ListFailAction,
     ListUpdate,
@@ -58,19 +59,26 @@ from gridplayer.params.static import (
     VideoDriver,
     VideoEndAction,
     VideoInitialState,
+    VideoQuality,
     VideoTransform,
 )
 from gridplayer.params.subtitle_encodings import DEFAULT_ENCODING
 from gridplayer.params.subtitle_style import SUBTITLE_STYLE_DEFAULTS
 from gridplayer.utils.app_dir import get_app_data_dir
-from gridplayer.utils.log_config import DISABLED
 
 SETTINGS = None
 
 
 _default_settings = {
-    "player/video_driver": VideoDriver.VLC_HW,
+    "player/video_driver": VideoDriver.MPV_HW,
     "player/video_driver_players": 4,
+    "player/video_quality": VideoQuality.AUTO,
+    # a card's name or a GpuChoice, see gridplayer.utils.gpu_adapters
+    "player/gpu_adapter": GpuChoice.AUTO,
+    "player/hardware_decoding": HardwareDecoding.AUTO,
+    "player/fast_scrubbing": True,
+    # as a percentage; past 100 is amplified, and can distort
+    "player/max_volume": 150,
     "player/video_init_timeout": 120,
     "player/inhibit_screensaver": True,
     "player/media_keys_background": True,
@@ -233,16 +241,14 @@ _default_settings = {
     **SUBTITLE_STYLE_DEFAULTS,
     "misc/mouse_hide": True,
     "misc/mouse_hide_timeout": 5,
-    "misc/vlc_options": "",
+    "misc/mpv_options": "",
     "logging/log_level": logging.WARNING,
-    "logging/log_level_vlc": DISABLED,
     "logging/log_limit": False,
     "logging/log_limit_size": 10,
     "logging/log_limit_backups": 1,
     "internal/opaque_hw_overlay": False,
     "internal/fake_overlay_invisibility": False,
     "internal/force_native_drag_events": False,
-    "internal/hw_crop_border_offset": HWCropBorderOffset.AUTO,
     "streaming/hls_via_streamlink": True,
     "streaming/resolver_priority": URLResolver.STREAMLINK,
     "streaming/resolver_priority_patterns": ResolverPatterns([]),
@@ -288,8 +294,9 @@ _default_settings = {
     "last_playlist": "",
 }
 
+# mpv can't draw into a window of another process there
 if env.IS_MACOS:
-    _default_settings["player/video_driver"] = VideoDriver.VLC_HW_SP
+    _default_settings["player/video_driver"] = VideoDriver.MPV_SW
 
 
 class _Settings:

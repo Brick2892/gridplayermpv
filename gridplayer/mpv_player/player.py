@@ -1,0 +1,1144 @@
+"""A video played by libmpv, driven over the same commands as a VLC player.
+
+Everything libmpv tells us arrives on its event thread, and is either passed
+straight on (the time, the pause) or sent to this player's own command thread
+to be dealt with there, so that only one thread ever drives the player.
+"""
+
+import dataclasses
+import logging
+import shlex
+import tempfile
+from collections import deque
+from fractions import Fraction
+from pathlib import Path
+from threading import Timer
+from time import monotonic
+
+from gridplayer.models.audio_device import AudioDevice, resolve_device_id
+from gridplayer.models.audio_selection import AudioExternal, track_of_file
+from gridplayer.models.chapter import Chapter
+from gridplayer.models.subtitle_selection import SubtitleExternal
+from gridplayer.models.subtitle_selection import track_of_file as subtitle_track_of_file
+from gridplayer.mpv_player.static import (
+    DISABLED_TRACK,
+    AudioTrack,
+    Media,
+    MediaInput,
+    SubtitleTrack,
+    VideoTrack,
+    wanted_audio_track_id,
+    wanted_subtitle_track_id,
+)
+from gridplayer.mpv_player.performance import (
+    QUALITY_OPTIONS,
+    auto_quality,
+    hwdec_value,
+    is_better,
+    is_falling_behind,
+    stepped_down,
+)
+from gridplayer.multiprocess.command_loop import CommandLoopThreaded
+from gridplayer.params import env
+from gridplayer.params.static import (
+    AudioChannelMode,
+    HardwareDecoding,
+    VideoDeinterlace,
+    VideoDeinterlaceMode,
+    VideoQuality,
+    VideoTransform,
+    ViewParams,
+)
+from gridplayer.params.subtitle_style import (
+    SUBTITLE_STYLE_SETTINGS,
+    mpv_subtitle_style_options,
+)
+from gridplayer.settings import Settings
+from gridplayer.utils.aspect_calc import (
+    calc_ratio_crop,
+    calc_shown_pixel_aspect,
+    calc_view_placement,
+)
+from gridplayer.utils.network import player_user_agent
+
+# mpv reports the time every frame; the player has no use for more than this
+TIME_REPORT_INTERVAL_S = 0.05
+
+# how often Auto quality looks at whether a video is keeping up
+QUALITY_CHECK_INTERVAL_S = 3
+
+# a drag's seek that hasn't landed in this long isn't going to
+SCRUB_GIVE_UP_S = 1.0
+
+KEPT_ERROR_LINES = 20
+
+# files added this close together were picked together
+SUBTITLE_PICK_WINDOW_S = 1.0
+
+NO_CROP = "0x0+0+0"
+
+TRACK_NONE = "no"
+
+# the rotation the file asks for, in degrees clockwise, as the player's own
+ORIENTATIONS = {
+    90: VideoTransform.ROTATE_90,
+    180: VideoTransform.ROTATE_180,
+    270: VideoTransform.ROTATE_270,
+}
+
+TRANSFORM_ROTATIONS = {
+    VideoTransform.ROTATE_90: 90,
+    VideoTransform.ROTATE_180: 180,
+    VideoTransform.ROTATE_270: 270,
+}
+
+TRANSFORM_FILTERS = {
+    VideoTransform.HFLIP: "hflip",
+    VideoTransform.VFLIP: "vflip",
+    VideoTransform.TRANSPOSE: "lavfi=[transpose=0]",
+    VideoTransform.ANTITRANSPOSE: "lavfi=[transpose=3]",
+}
+
+# the filter that comes out as the transform, once the picture is turned on
+# its side after it
+FILTERS_ON_TURNED = {
+    VideoTransform.HFLIP: VideoTransform.VFLIP,
+    VideoTransform.VFLIP: VideoTransform.HFLIP,
+    VideoTransform.TRANSPOSE: VideoTransform.ANTITRANSPOSE,
+    VideoTransform.ANTITRANSPOSE: VideoTransform.TRANSPOSE,
+}
+
+CHANNEL_MODE_FILTERS = {
+    AudioChannelMode.DOLBYS: (
+        "lavfi=[aresample=out_chlayout=stereo:matrix_encoding=dplii]"
+    ),
+    AudioChannelMode.HEADPHONES: "lavfi=[crossfeed]",
+    AudioChannelMode.RSTEREO: "lavfi=[pan=stereo|c0=c1|c1=c0]",
+    AudioChannelMode.LEFT: "lavfi=[pan=stereo|c0=c0|c1=c0]",
+    AudioChannelMode.RIGHT: "lavfi=[pan=stereo|c0=c1|c1=c1]",
+    AudioChannelMode.MONO: "lavfi=[pan=mono|c0=0.5*c0+0.5*c1]",
+}
+
+
+def translate(context, text):
+    """A dummy to make strings discoverable via pylupdate."""
+    return text
+
+
+def only_initialized_player(func):
+    def wrapper(self, *args, **kwargs):
+        if self._mpv is not None:
+            return func(self, *args, **kwargs)
+
+    return wrapper
+
+
+def track_sar(par) -> tuple[int, int] | None:
+    if not par:
+        return None
+
+    aspect = Fraction(par).limit_denominator(10000)
+
+    return aspect.numerator, aspect.denominator
+
+
+class MpvPlayerThreaded(CommandLoopThreaded):
+    # the scaling options mean nothing to a driver that doesn't draw on the GPU
+    is_quality_managed = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self._log = logging.getLogger(self.__class__.__name__)
+
+        self._mpv = None
+        self._is_released = False
+
+        self.media_input: MediaInput | None = None
+        self.media: Media | None = None
+
+        self.is_video_initialized = False
+        self._is_paused = False
+        self._is_file_open = False
+        self._is_playback_reported = False
+        self._opened_on: tuple[int | None, int | None] | None = None
+
+        self._timer_load = None
+        self._last_time_report = 0.0
+        self._last_subtitle_add = 0.0
+
+        self._size = (0, 0)
+        self._view: ViewParams | None = None
+        self._last_crop = None
+        self._last_keepaspect = None
+
+        self._typed_options = frozenset()
+
+        self._hardware_decoding = HardwareDecoding.AUTO
+        self._quality = VideoQuality.AUTO
+        self._applied_quality: VideoQuality | None = None
+        self._auto_quality: VideoQuality | None = None
+        self._quality_steps_down = 0
+        self._last_quality_check = 0.0
+        self._drops_at_check: tuple[int, float] | None = None
+
+        self._is_scrub_in_flight = False
+        self._scrub_wanted: int | None = None
+        self._scrub_sent_at = 0.0
+
+        self._error_lines = deque(maxlen=KEPT_ERROR_LINES)
+
+    # --- what a concrete driver has to say
+
+    def _mpv_options(self) -> dict:
+        raise NotImplementedError
+
+    def _pane_pixels(self) -> float:
+        """How many real pixels the video is shown over."""
+
+        width, height = self.media_input.size
+
+        return width * height
+
+    # --- setup and teardown
+
+    def start(self):
+        self.cmd_loop_start_thread(self.init_player)
+
+    def init_player(self):
+        import mpv
+
+        self._hardware_decoding = Settings().sync_get("player/hardware_decoding")
+        self._quality = Settings().sync_get("player/video_quality")
+
+        options = {
+            "config": False,
+            "load_scripts": False,
+            "ytdl": False,
+            "osc": False,
+            "osd_level": 0,
+            "idle": "yes",
+            "hwdec": hwdec_value(self._hardware_decoding, needs_frames_in_memory=False),
+            "hr_seek": "yes",
+            "mute": True,
+            "volume_max": str(Settings().sync_get("player/max_volume")),
+            "pause": True,
+            "audio_file_auto": "no",
+            "sub_auto": "no",
+            "cursor_autohide": "no",
+            "input_cursor": "no",
+            "input_cursor_passthrough": "yes",
+            **self._subtitle_style(),
+            **self._mpv_options(),
+        }
+
+        self._mpv = mpv.MPV(log_handler=self._on_log, loglevel="warn", **options)
+
+        self._apply_options_typed_by_hand()
+
+        self._mpv.register_event_callback(self._on_mpv_event)
+
+        self._mpv.observe_property("time-pos", self._on_time_pos)
+        self._mpv.observe_property("pause", self._on_pause)
+        self._mpv.observe_property("track-list", self._on_track_list)
+        self._mpv.observe_property("chapter-list", self._on_chapter_list)
+        self._mpv.observe_property("video-params", self._on_video_params)
+
+    @staticmethod
+    def _subtitle_style() -> dict:
+        style = {key: Settings().sync_get(key) for key in SUBTITLE_STYLE_SETTINGS}
+
+        return mpv_subtitle_style_options(style)
+
+    def _apply_options_typed_by_hand(self):
+        """The mpv options setting: --name=value and --flag, unknown ones logged.
+
+        What is typed here is the viewer's last word: the settings that come
+        to the same options leave these alone (see _set_unless_typed).
+        """
+
+        typed = set()
+
+        for option in shlex.split(Settings().sync_get("misc/mpv_options")):
+            name, _, value = option.lstrip("-").partition("=")
+
+            if name:
+                typed.add(name.replace("_", "-"))
+                self._set(name, value or "yes")
+
+        self._typed_options = frozenset(typed)
+
+    def _set_unless_typed(self, name, value):
+        if name not in self._typed_options:
+            self._set(name, value)
+
+    def cmd_process_command(self, command_args, command_name):
+        if self._is_released:
+            return
+
+        super().cmd_process_command(command_args, command_name)
+
+    def cleanup(self):
+        self.is_video_initialized = False
+        self._is_released = True
+
+        self._cancel_load_timer()
+
+        if self._mpv is not None:
+            player = self._mpv
+            self._mpv = None
+
+            player.terminate()
+
+            self._log.debug("Player released")
+
+    def error(self, message):
+        self._log.error(message)
+
+        self._cancel_load_timer()
+
+        self.cmd_send("error_state", message, tuple(self._error_lines))
+
+    # --- what mpv tells us, on its event thread
+
+    def _on_log(self, level, prefix, text):
+        line = f"{prefix}: {text.strip()}"
+
+        if level in {"fatal", "error"}:
+            self._error_lines.append(line)
+            self._log.warning(line)
+        else:
+            self._log.debug(line)
+
+    def _send_from_event(self, command_name, *args):
+        if not self._is_released:
+            self.cmd_send_self(command_name, *args)
+
+    def _on_mpv_event(self, event):
+        import mpv
+
+        event_id = event.event_id.value
+
+        if event_id == mpv.MpvEventID.FILE_LOADED:
+            self._send_from_event("on_file_loaded")
+
+        elif event_id == mpv.MpvEventID.PLAYBACK_RESTART:
+            self._send_from_event("on_playback_restart")
+
+        elif event_id == mpv.MpvEventID.END_FILE:
+            self._send_from_event("on_end_file", event.data.reason)
+
+    def _on_time_pos(self, _name, value):
+        if value is None or not self.is_video_initialized:
+            return
+
+        now = monotonic()
+
+        if now - self._last_time_report < TIME_REPORT_INTERVAL_S:
+            return
+
+        self._last_time_report = now
+
+        self.cmd_send("time_changed_emit", int(value * 1000))
+
+        if (
+            self._is_quality_automatic
+            and now - self._last_quality_check >= QUALITY_CHECK_INTERVAL_S
+        ):
+            self._last_quality_check = now
+            self._send_from_event("on_quality_check")
+
+    def _on_pause(self, _name, value):
+        if value is None:
+            return
+
+        self._send_from_event("on_pause_changed", bool(value))
+
+    def _on_track_list(self, _name, value):
+        if value is not None:
+            self._send_from_event("on_tracks_listed")
+
+    def _on_chapter_list(self, _name, value):
+        if value is not None:
+            self._send_from_event("on_chapters_listed")
+
+    def _on_video_params(self, _name, value):
+        if value:
+            self._send_from_event("on_video_params", value.get("w"), value.get("h"))
+
+    # --- the same, on the command thread
+
+    def on_file_loaded(self):
+        self._is_file_open = True
+
+        self._attach_external_files()
+
+        self.media = self._read_media()
+
+        if self.media.length == -1 and not self.media_input.is_live:
+            self._log.debug("Media length is not known, probably live stream")
+            self.media_input.is_live = True
+            self._set("loop-file", "no")
+
+        self.media_input.length = self.media.length
+
+        self._apply_wanted_tracks()
+        self._apply_wanted_audio_device()
+
+        self._apply_filter_for_orientation()
+
+        self._view = self.media_input.view
+        self._size = self.media_input.size
+        self._apply_view()
+
+        if self._is_seek_after_load:
+            self._seek_ms(self.media_input.initial_time)
+
+    def on_playback_restart(self):
+        if self.media is None:
+            return
+
+        if self._is_scrub_in_flight:
+            self._is_scrub_in_flight = False
+
+            if self._scrub_wanted is not None:
+                self._send_scrub(self._scrub_wanted)
+
+        if not self.is_video_initialized:
+            self._finish_load()
+
+        if not self._is_playback_reported:
+            self._is_playback_reported = True
+            self.cmd_send("playback_started_emit")
+
+    def _finish_load(self):
+        self._log.debug("Load finished")
+
+        self._cancel_load_timer()
+
+        self.media = self._read_media()
+
+        self.is_video_initialized = True
+
+        self.cmd_send("load_video_done", self.media)
+        self.cmd_send("playback_status_changed_emit", self._is_paused)
+        self.cmd_send("time_changed_emit", self.media_input.initial_time)
+
+    def on_end_file(self, reason):
+        import mpv
+
+        was_open = self._is_file_open
+        self._is_file_open = False
+
+        if reason == mpv.MpvEventEndFile.ERROR:
+            self.error(
+                translate("Video Error", "Player error")
+                if self.is_video_initialized
+                else translate("Video Error", "Failed to load media")
+            )
+
+        elif reason == mpv.MpvEventEndFile.EOF and was_open:
+            if self.media_input is not None and self.media_input.is_live:
+                self.error(translate("Video Error", "Live stream ended"))
+            elif not self.is_video_initialized:
+                self.error(
+                    translate("Video Error", "Video stopped before initialization")
+                )
+
+    def on_load_timeout(self):
+        if not self.is_video_initialized:
+            self.error(translate("Video Error", "Buffering timeout"))
+
+    def on_quality_check(self):
+        """Give up a step of Auto quality where a video can't keep up."""
+
+        dropped = self._get("frame-drop-count")
+
+        if dropped is None or self._applied_quality is VideoQuality.FAST:
+            return
+
+        now = monotonic()
+        last, self._drops_at_check = self._drops_at_check, (dropped, now)
+
+        # the first check of a load has only a start to measure from
+        if last is None:
+            return
+
+        if is_falling_behind(
+            dropped - last[0],
+            now - last[1],
+            self._get("container-fps"),
+            self._get("speed") or 1,
+            self._get("display-fps"),
+        ):
+            self._quality_steps_down += 1
+            self._drops_at_check = None
+
+            self._log.info("Not keeping up, lowering the picture quality")
+
+            self._apply_quality()
+
+    def on_pause_changed(self, is_paused):
+        if is_paused == self._is_paused:
+            return
+
+        self._is_paused = is_paused
+
+        if self.is_video_initialized:
+            self.cmd_send("playback_status_changed_emit", is_paused)
+
+    def on_tracks_listed(self):
+        if not self.is_video_initialized or self.media is None or self._mpv is None:
+            return
+
+        media = self._read_media()
+
+        is_same_list = (
+            set(media.video_tracks) == set(self.media.video_tracks)
+            and set(media.audio_tracks) == set(self.media.audio_tracks)
+            and set(media.subtitle_tracks) == set(self.media.subtitle_tracks)
+        )
+
+        if is_same_list:
+            return
+
+        self.media = media
+
+        self.cmd_send("tracks_changed_emit", self.media)
+
+    def on_chapters_listed(self):
+        if not self.is_video_initialized or self.media is None or self._mpv is None:
+            return
+
+        chapters = self._read_chapters()
+
+        if chapters == self.media.chapters:
+            return
+
+        self.media = dataclasses.replace(self.media, chapters=chapters)
+
+        self.cmd_send("chapters_changed_emit", chapters)
+
+    def on_video_params(self, width, height):
+        """The picture's size, which a stream only says once it is decoded."""
+
+        track = self._shown_video_track()
+
+        if track is None or all(track.video_dimensions) or not (width and height):
+            return
+
+        track.video_dimensions = (width, height)
+
+        self._apply_view()
+
+        if self.is_video_initialized:
+            self.cmd_send("set_video_dimensions", width, height, track.sar)
+
+    # --- loading
+
+    @property
+    def _is_seek_after_load(self) -> bool:
+        """A random start needs the length, only known once the file is open."""
+
+        video = self.media_input.video
+
+        return (
+            not self.media_input.is_live
+            and video.is_start_random
+            and video.current_position == 0
+        )
+
+    @only_initialized_player
+    def load_video(self, media_input: MediaInput):
+        self.media_input = media_input
+        self.media = None
+        self.is_video_initialized = False
+        self._is_file_open = False
+        self._is_playback_reported = False
+        self._opened_on = None
+        self._last_crop = None
+        self._last_keepaspect = None
+        self._drops_at_check = None
+        self._is_scrub_in_flight = False
+        self._scrub_wanted = None
+        self._error_lines.clear()
+
+        self._log.info(f"Loading {media_input.uri}")
+
+        self.cmd_send(
+            "update_status_emit", translate("Video Status", "Preparing video output"), 0
+        )
+
+        self._is_paused = media_input.video.is_paused
+
+        self._set("pause", self._is_paused)
+        self._set("loop-file", "no" if media_input.is_live else "inf")
+        self._set("vid", TRACK_NONE if media_input.is_audio_only else "auto")
+        self._set("sub-codepage", media_input.video.subtitle_encoding or "auto")
+
+        self._apply_http_options(media_input.http_headers)
+        self._apply_transform(media_input.video.transform)
+        self._apply_deinterlace(media_input.video.deinterlace)
+        self._apply_quality()
+
+        if media_input.is_live or self._is_seek_after_load:
+            self._set("start", "none")
+        else:
+            self._set("start", f"{media_input.initial_time / 1000:.3f}")
+
+        self._cancel_load_timer()
+        self._timer_load = Timer(
+            Settings().sync_get("player/video_init_timeout"),
+            self.cmd_send_self,
+            args=("on_load_timeout",),
+        )
+        self._timer_load.daemon = True
+        self._timer_load.start()
+
+        self._mpv.loadfile(media_input.uri)
+
+    def _cancel_load_timer(self):
+        if self._timer_load is not None:
+            self._timer_load.cancel()
+            self._timer_load = None
+
+    def _apply_http_options(self, headers: dict[str, str]):
+        lowered = {name.lower(): value for name, value in headers.items()}
+
+        self._set("user-agent", lowered.get("user-agent") or player_user_agent())
+        self._set("referrer", lowered.get("referer", ""))
+
+    def _apply_transform(self, transform: VideoTransform | None):
+        video_filter = TRANSFORM_FILTERS.get(transform, "")
+
+        # a filter can't read a frame still on the GPU
+        self._set_unless_typed(
+            "hwdec",
+            hwdec_value(self._hardware_decoding, needs_frames_in_memory=bool(video_filter)),
+        )
+        self._set("video-rotate", TRANSFORM_ROTATIONS.get(transform, 0))
+        self._set("vf", video_filter)
+
+    def _apply_filter_for_orientation(self):
+        """Mirror the way the viewer sees it, on a file that says to turn.
+
+        A filter runs before mpv turns the picture, so on one shown on its
+        side what looks like a left-right mirror is an up-down one to the
+        filter.
+        """
+
+        track = self._shown_video_track()
+        turned = FILTERS_ON_TURNED.get(self.media_input.video.transform)
+
+        if track is not None and track.is_turned and turned is not None:
+            self._set("vf", TRANSFORM_FILTERS[turned])
+
+    @property
+    def _is_quality_automatic(self) -> bool:
+        return self.is_quality_managed and self._quality is VideoQuality.AUTO
+
+    def _wanted_quality(self) -> VideoQuality:
+        if not self._is_quality_automatic:
+            return self._quality
+
+        by_size = auto_quality(self._pane_pixels())
+
+        # shown bigger is a new situation, and worth another try
+        if self._auto_quality is not None and is_better(by_size, self._auto_quality):
+            self._quality_steps_down = 0
+
+        self._auto_quality = by_size
+
+        return stepped_down(by_size, self._quality_steps_down)
+
+    def _apply_quality(self):
+        # a profile typed in the mpv options is a preset of the viewer's own
+        if not self.is_quality_managed or "profile" in self._typed_options:
+            return
+
+        quality = self._wanted_quality()
+
+        if quality is self._applied_quality:
+            return
+
+        self._applied_quality = quality
+
+        self._log.debug(f"Picture quality {quality.value}")
+
+        for name, value in QUALITY_OPTIONS[quality].items():
+            self._set_unless_typed(name, value)
+
+    def _attach_external_files(self):
+        if self.media_input.selected_audio_slave:
+            self._add_file(self._mpv.audio_add, self.media_input.selected_audio_slave)
+
+        for uri in self.media_input.selected_subtitle_slaves:
+            self._add_file(self._mpv.sub_add, uri)
+
+    def _add_file(self, add_func, uri, flags="auto") -> bool:
+        try:
+            add_func(uri, flags)
+        except Exception:
+            self._log.warning(f"Failed to add {uri}", exc_info=True)
+            return False
+
+        return True
+
+    # --- reading what mpv has
+
+    def _read_media(self) -> Media:
+        tracks = self._get("track-list") or []
+
+        video_tracks, audio_tracks, subtitle_tracks = {}, {}, {}
+        current = {"video": None, "audio": None, "sub": None}
+        external = {"audio": [], "sub": []}
+
+        for track in tracks:
+            kind, track_id = track["type"], track["id"]
+
+            if kind == "video":
+                video_tracks[track_id] = self._video_track(track)
+            elif kind == "audio":
+                audio_tracks[track_id] = self._audio_track(track)
+            elif kind == "sub":
+                subtitle_tracks[track_id] = self._subtitle_track(track)
+            else:
+                continue
+
+            if track.get("selected"):
+                current[kind] = track_id
+
+            if track.get("external") and kind in external:
+                external[kind].append(track_id)
+
+        # a live stream has a duration too, of the few segments on offer
+        duration = None if self.media_input.is_live else self._get("duration")
+
+        # what it opened on is said once, before anything was asked of it
+        if self._opened_on is None:
+            self._opened_on = (current["audio"], current["sub"])
+
+        return Media(
+            length=int(duration * 1000) if duration else -1,
+            video_tracks=video_tracks,
+            audio_tracks=audio_tracks,
+            cur_video_track_id=current["video"],
+            cur_audio_track_id=current["audio"],
+            external_audio_ids=tuple(external["audio"]),
+            default_audio_track_id=self._opened_on[0],
+            subtitle_tracks=subtitle_tracks,
+            cur_subtitle_track_id=current["sub"],
+            external_subtitle_ids=tuple(external["sub"]),
+            default_subtitle_track_id=self._opened_on[1],
+            audio_devices=self._read_audio_devices(),
+            chapters=self._read_chapters(),
+        )
+
+    @staticmethod
+    def _video_track(track: dict) -> VideoTrack:
+        return VideoTrack(
+            codec=track.get("codec") or "",
+            bitrate=int(track.get("demux-bitrate") or 0),
+            language=track.get("lang"),
+            description=track.get("title"),
+            video_dimensions=(track.get("demux-w") or 0, track.get("demux-h") or 0),
+            fps=track.get("demux-fps"),
+            orientation=ORIENTATIONS.get(
+                track.get("demux-rotation") or 0, VideoTransform.NONE
+            ),
+            sar=track_sar(track.get("demux-par")),
+        )
+
+    @staticmethod
+    def _audio_track(track: dict) -> AudioTrack:
+        return AudioTrack(
+            codec=track.get("codec") or "",
+            bitrate=int(track.get("demux-bitrate") or 0),
+            language=track.get("lang"),
+            description=track.get("title"),
+            channels=track.get("demux-channel-count") or 0,
+            rate=track.get("demux-samplerate") or 0,
+        )
+
+    @staticmethod
+    def _subtitle_track(track: dict) -> SubtitleTrack:
+        return SubtitleTrack(
+            codec=track.get("codec") or "",
+            bitrate=0,
+            language=track.get("lang"),
+            description=track.get("title") or track.get("external-filename"),
+        )
+
+    def _read_chapters(self) -> tuple[Chapter, ...]:
+        chapters = self._get("chapter-list") or []
+
+        return tuple(
+            Chapter(start_ms=int(chapter["time"] * 1000), name=chapter.get("title"))
+            for chapter in chapters
+        )
+
+    def _read_audio_devices(self) -> tuple[AudioDevice, ...]:
+        devices = self._get("audio-device-list") or []
+
+        return tuple(
+            AudioDevice(id=device["name"], name=device.get("description"))
+            for device in devices
+            if device["name"] != "auto"
+        )
+
+    def _get(self, name):
+        try:
+            # as attributes: mpv["..."] reaches options only, not properties
+            return getattr(self._mpv, name.replace("-", "_"))
+        except Exception:
+            self._log.debug(f"Failed to read {name}", exc_info=True)
+            return None
+
+    def _set(self, name, value) -> bool:
+        try:
+            setattr(self._mpv, name.replace("-", "_"), value)
+        except Exception:
+            self._log.warning(f"Failed to set {name}={value!r}", exc_info=True)
+            return False
+
+        return True
+
+    def _shown_video_track(self) -> VideoTrack | None:
+        if self.media is None:
+            return None
+
+        return self.media.video_tracks.get(self.media.cur_video_track_id)
+
+    # --- what the settings ask for
+
+    def _apply_wanted_tracks(self):
+        video = self.media_input.video
+        media = self.media
+
+        audio_id = wanted_audio_track_id(video, media.audio_tracks)
+
+        if isinstance(video.audio_selection, AudioExternal):
+            picked = track_of_file(video.audio_selection, media.external_audio_ids)
+            audio_id = audio_id if picked is None else picked
+
+        self._select_track("aid", audio_id)
+
+        self._apply_wanted_subtitle_track()
+
+    def _apply_wanted_subtitle_track(self):
+        video = self.media_input.video
+        media = self.media
+
+        if not media.subtitle_tracks:
+            return
+
+        subtitle_id = wanted_subtitle_track_id(
+            video, media.subtitle_tracks, media.external_subtitle_ids
+        )
+
+        if isinstance(video.subtitle_selection, SubtitleExternal):
+            picked = subtitle_track_of_file(
+                video.subtitle_selection, media.external_subtitle_ids
+            )
+            subtitle_id = subtitle_id if picked is None else picked
+
+        self._select_track("sid", subtitle_id)
+
+    def _select_track(self, prop: str, track_id: int | None):
+        if track_id is None:
+            return
+
+        self._set(prop, TRACK_NONE if track_id == DISABLED_TRACK else track_id)
+
+    def _apply_wanted_audio_device(self):
+        wanted = self.media_input.video.audio_device
+
+        if wanted is None:
+            return
+
+        device_id = resolve_device_id(wanted, self.media.audio_devices)
+
+        if device_id is None:
+            self._log.warning(f"Audio device {wanted.name or wanted.id} is not here")
+            return
+
+        self._set("audio-device", device_id)
+
+    def _apply_deinterlace(self, deinterlace: VideoDeinterlace):
+        # mpv picks the deinterlacer that suits the decoder itself, so the
+        # modes VLC offers have nothing to map to.
+        value = {VideoDeinterlace.ON: "yes", VideoDeinterlace.OFF: "no"}.get(
+            deinterlace, "auto"
+        )
+
+        self._set("deinterlace", value)
+
+    # --- commands
+
+    def _grab_frame(self) -> Path | None:
+        tmp_root = env.FLATPAK_RUNTIME_DIR if env.IS_FLATPAK else None
+
+        file_path = Path(tempfile.mkdtemp(dir=tmp_root)) / "snapshot.png"
+
+        try:
+            self._mpv.screenshot_to_file(str(file_path))
+        except Exception:
+            self._log.warning("Failed to grab frame", exc_info=True)
+
+        if not file_path.is_file():
+            file_path.parent.rmdir()
+            return None
+
+        return file_path
+
+    @only_initialized_player
+    def snapshot(self):
+        file_path = self._grab_frame()
+
+        self.cmd_send("snapshot_taken_emit", str(file_path) if file_path else "")
+
+    def screenshot(self):
+        file_path = self._grab_frame() if self._mpv is not None else None
+
+        self.cmd_send("screenshot_taken_emit", str(file_path) if file_path else "")
+
+    @only_initialized_player
+    def play(self):
+        self.set_pause(False)
+
+    @only_initialized_player
+    def set_pause(self, is_paused):
+        self._log.debug(f"Set pause {is_paused}")
+
+        if is_paused == self._is_paused:
+            # nothing will change, and the widget is waiting to hear back
+            self.cmd_send("playback_status_changed_emit", is_paused)
+            return
+
+        self._set("pause", is_paused)
+
+    @only_initialized_player
+    def set_time(self, seek_ms):
+        if self.media_input is None or self.media_input.is_live or self.media is None:
+            return
+
+        self._is_scrub_in_flight = False
+        self._scrub_wanted = None
+
+        self._seek_ms(seek_ms)
+
+    @only_initialized_player
+    def set_time_keyframe(self, seek_ms):
+        """One seek at a time, then the latest asked for meanwhile.
+
+        Each new seek makes mpv drop the one before it, so a drag sending them
+        faster than frames come shows none of them until it stops.
+        """
+
+        if self.media_input is None or self.media_input.is_live or self.media is None:
+            return
+
+        is_waiting = monotonic() - self._scrub_sent_at < SCRUB_GIVE_UP_S
+
+        if self._is_scrub_in_flight and is_waiting:
+            self._scrub_wanted = seek_ms
+            return
+
+        self._send_scrub(seek_ms)
+
+    def _send_scrub(self, seek_ms):
+        self._is_scrub_in_flight = True
+        self._scrub_wanted = None
+        self._scrub_sent_at = monotonic()
+
+        self._seek_ms(seek_ms, "absolute+keyframes")
+
+    def _seek_ms(self, seek_ms, mode="absolute+exact"):
+        seek_ms = max(seek_ms, 0)
+
+        if self.media.length > 0:
+            seek_ms = min(seek_ms, self.media.length - 1)
+
+        self._mpv.command_async(
+            "seek", seek_ms / 1000, mode, callback=_ignore_seek_result
+        )
+
+    @only_initialized_player
+    def set_playback_rate(self, rate):
+        if self.media_input is None or not self.media_input.is_live:
+            self._set("speed", rate)
+
+    @only_initialized_player
+    def audio_set_mute(self, is_muted):
+        self._set("mute", bool(is_muted))
+
+    @only_initialized_player
+    def audio_set_volume(self, volume_percent: float):
+        self._set("volume", volume_percent * 100)
+
+    @only_initialized_player
+    def set_audio_track(self, track_id):
+        self._select_track("aid", track_id)
+
+    @only_initialized_player
+    def set_video_track(self, track_id):
+        self._select_track("vid", track_id)
+
+    @only_initialized_player
+    def set_subtitle_track(self, track_id):
+        self._select_track("sid", track_id)
+
+    @only_initialized_player
+    def set_audio_device(self, device: AudioDevice | None):
+        self.media_input.video.audio_device = device
+
+        if device is None:
+            self._set("audio-device", "auto")
+        elif self.media is not None:
+            self._apply_wanted_audio_device()
+
+    @only_initialized_player
+    def add_audio_slave(self, uri: str):
+        if self.media is None or not uri:
+            return
+
+        # sound added while playing is sound to be heard right away
+        if self._add_file(self._mpv.audio_add, uri, "select"):
+            self.media_input.selected_audio_slave = uri
+
+    @only_initialized_player
+    def add_subtitle_slave(self, uri: str):
+        if self.media is None or not uri:
+            return
+
+        if uri in self.media_input.selected_subtitle_slaves:
+            return
+
+        # Files are only ever added while playing because the viewer just
+        # picked them, and of several picked at once the first is shown. The
+        # pick itself is not known here: this process has its own copy of the
+        # video, from when the load started.
+        now = monotonic()
+        is_first_of_pick = now - self._last_subtitle_add > SUBTITLE_PICK_WINDOW_S
+        self._last_subtitle_add = now
+
+        flags = "select" if is_first_of_pick else "auto"
+
+        if not self._add_file(self._mpv.sub_add, uri, flags):
+            return
+
+        self.media_input.selected_subtitle_slaves = (
+            *self.media_input.selected_subtitle_slaves,
+            uri,
+        )
+
+        self.media = self._read_media()
+
+        self.cmd_send("tracks_changed_emit", self.media)
+
+    @only_initialized_player
+    def set_audio_channel_mode(self, mode: AudioChannelMode):
+        self._set("af", CHANNEL_MODE_FILTERS.get(mode, ""))
+
+    @only_initialized_player
+    def set_deinterlace(
+        self, deinterlace: VideoDeinterlace, mode: VideoDeinterlaceMode
+    ):
+        self.media_input.video.deinterlace = deinterlace
+        self.media_input.video.deinterlace_mode = mode
+
+        self._apply_deinterlace(deinterlace)
+
+    @only_initialized_player
+    def set_audio_delay(self, delay_ms: int):
+        self._set("audio-delay", delay_ms / 1000)
+
+    @only_initialized_player
+    def set_subtitle_delay(self, delay_ms: int):
+        self._set("sub-delay", delay_ms / 1000)
+
+    # --- the view
+
+    @only_initialized_player
+    def adjust_view(self, size, view: ViewParams):
+        self._size = size
+        self._view = view
+
+        if self.media_input is not None:
+            self.media_input.size = size
+            self._apply_quality()
+
+        self._apply_view()
+
+    def _apply_view(self):
+        """Cut the frame down to what is on show.
+
+        The widget has already put the surface exactly over where that goes,
+        so mpv only has to stretch it to fill the surface.
+        """
+
+        track = self._shown_video_track()
+
+        if track is None or self._view is None:
+            return
+
+        crop, keep_aspect = self._view_crop(track)
+
+        if crop != self._last_crop:
+            self._last_crop = crop
+            self._set("video-crop", crop)
+
+        if keep_aspect != self._last_keepaspect:
+            self._last_keepaspect = keep_aspect
+            self._set("keepaspect", keep_aspect)
+
+    @property
+    def _is_transformed(self) -> bool:
+        return self.media_input.video.transform not in {None, VideoTransform.NONE}
+
+    def _view_crop(self, track: VideoTrack) -> tuple[str, bool]:
+        # one that is turned or flipped is drawn whole, see calc_whole_placement:
+        # mpv crops before it rotates, so a crop would land on the wrong axis
+        if track.is_reoriented or self._is_transformed:
+            return NO_CROP, False
+
+        frame_size = track.video_dimensions
+
+        if not all(frame_size):
+            return NO_CROP, True
+
+        view = self._view
+        transform = self.media_input.video.transform
+
+        pixel_aspect = calc_shown_pixel_aspect(
+            frame_size, transform, view.aspect_ratio, track.stored_pixel_aspect
+        )
+
+        if view.crop_ratio:
+            view = view._replace(
+                crop=calc_ratio_crop(
+                    frame_size, transform, view.crop_ratio, pixel_aspect
+                )
+            )
+
+        placement = calc_view_placement(
+            frame_size, self._size, view, transform, pixel_aspect=pixel_aspect
+        )
+
+        if placement is None:
+            return NO_CROP, True
+
+        x, y, width, height = placement.source
+
+        left, top = max(round(x), 0), max(round(y), 0)
+        crop_w = max(min(round(x + width), frame_size[0]) - left, 1)
+        crop_h = max(min(round(y + height), frame_size[1]) - top, 1)
+
+        if (crop_w, crop_h) == frame_size:
+            return NO_CROP, False
+
+        return f"{crop_w}x{crop_h}+{left}+{top}", False
+
+
+def _ignore_seek_result(_error, _result):
+    """A seek that failed left the video where it was, which is all it can do."""

@@ -7,7 +7,7 @@ from gridplayer.main.init_app import init_app
 from gridplayer.main.init_icons import init_icon
 from gridplayer.params import env
 from gridplayer.settings import Settings
-from gridplayer.utils.libvlc import init_vlc
+from gridplayer.utils.libmpv import init_mpv
 from gridplayer.utils.qt import translate
 from gridplayer.widgets.tooltip import install_tooltips
 
@@ -16,26 +16,20 @@ def run_app():
     app = init_app()
 
     try:
-        vlc_version, vlc_python_version = init_vlc()
+        env.MPV_VERSION = init_mpv()
     except FileNotFoundError:
         QCustomMessageBox.critical(
             None,
             "GridPlayer",
-            translate("Error", "VLC is not installed"),
+            translate("Error", "libmpv was not found"),
             info=translate(
                 "Error",
-                'GridPlayer plays videos with VLC. Get it from the <a href="'
-                'https://www.videolan.org/vlc/">VLC website</a>.',
+                "GridPlayer plays videos with libmpv, and could not load it.",
             ),
         )
         return 1
 
-    env.VLC_VERSION = vlc_version
-    env.VLC_PYTHON_VERSION = vlc_python_version
-
-    # Need to postpone import parts that depend on vlc
-    # because python-vlc loads VLC DLL on import
-    # and we need to set environment vars before that
+    # Postponed until libmpv can be found by what is imported here
     from gridplayer.player import Player
 
     player = Player()

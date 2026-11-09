@@ -23,12 +23,14 @@ from gridplayer.models.audio_selection import (
     track_of_file,
 )
 from gridplayer.models.video import default_audio_selection
+from gridplayer.mpv_player.static import DISABLED_TRACK, NO_TRACK, wanted_audio_track_id
 from gridplayer.params.extensions import SUPPORTED_AUDIO_EXT
 from gridplayer.params.static import (
     AUDIO_DELAY_STEP_MS,
     MAX_AUDIO_DELAY_MS,
     MIN_AUDIO_DELAY_MS,
 )
+from gridplayer.settings import Settings
 from gridplayer.utils.external_audio import (
     discover_audio_files,
     silenced_by_seeking,
@@ -36,12 +38,14 @@ from gridplayer.utils.external_audio import (
 )
 from gridplayer.utils.qt import translate
 from gridplayer.utils.track_language import normalize, pick_track
-from gridplayer.vlc_player.static import DISABLED_TRACK, NO_TRACK, wanted_audio_track_id
 from gridplayer.widgets.video_block_guards import (
     VideoBlockPart,
     only_initialized,
     only_local_file,
 )
+
+# dragging the volume bar within this share of it from 100% lands on 100%
+VOLUME_FULL_SNAP = 0.04
 
 
 def _file_names(file_paths) -> str:
@@ -558,7 +562,7 @@ class AudioControl(VideoBlockPart):
             warnings.append(
                 translate(
                     "Warning",
-                    "VLC cannot play {FILES} alongside a video.",
+                    "mpv cannot play {FILES} alongside a video.",
                 ).format(FILES=_file_names(unplayable))
             )
 
@@ -684,13 +688,31 @@ class AudioControl(VideoBlockPart):
 
         self._block.is_muted_change.emit(self._block.video_params.is_muted)
 
+    @property
+    def max_volume(self) -> float:
+        return Settings().get("player/max_volume") / 100
+
     @only_initialized
     def set_volume(self, percent):
-        self._block.video_params.volume = round(percent, 2)
+        max_volume = self.max_volume
+        volume = round(min(max(percent, 0), max_volume), 2)
 
-        self._block.video_driver.audio_set_volume(self._block.video_params.volume)
+        self._block.video_params.volume = volume
 
-        self._block.volume_change.emit(percent)
+        self._block.video_driver.audio_set_volume(volume)
+
+        self._block.volume_full_mark_change.emit(1 / max_volume)
+        self._block.volume_change.emit(volume / max_volume)
+
+    def set_volume_from_bar(self, position):
+        """Where along the bar, its top being the most the volume can be."""
+
+        max_volume = self.max_volume
+
+        # the mark on the bar is worth being able to hit, where there is one
+        is_at_mark = abs(position - 1 / max_volume) <= VOLUME_FULL_SNAP
+
+        self.set_volume(1.0 if is_at_mark else position * max_volume)
 
     @only_initialized
     def volume_increase(self):
@@ -698,7 +720,7 @@ class AudioControl(VideoBlockPart):
 
         self._block.video_params.volume += 0.05
         self._block.video_params.volume = min(
-            round(self._block.video_params.volume, 2), 1.0
+            round(self._block.video_params.volume, 2), self.max_volume
         )
 
         self.set_volume(self._block.video_params.volume)

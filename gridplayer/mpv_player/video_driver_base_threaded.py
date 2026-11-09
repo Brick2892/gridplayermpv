@@ -1,11 +1,11 @@
+from gridplayer.mpv_player.static import MediaInput
+from gridplayer.mpv_player.video_driver_base import PlayerDriver
 from gridplayer.multiprocess.command_loop import CommandLoopThreaded
 from gridplayer.multiprocess.process_manager import describe_exit_code
 from gridplayer.utils.qt import translate
-from gridplayer.vlc_player.static import MediaInput
-from gridplayer.vlc_player.video_driver_base import VLCVideoDriver
 
 
-class VLCVideoDriverThreaded(CommandLoopThreaded, VLCVideoDriver):
+class PlayerDriverThreaded(CommandLoopThreaded, PlayerDriver):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
@@ -63,6 +63,9 @@ class VLCVideoDriverThreaded(CommandLoopThreaded, VLCVideoDriver):
 
     def set_time(self, seek_ms):
         self.cmd_send("set_time", seek_ms)
+
+    def set_time_keyframe(self, seek_ms):
+        self.cmd_send("set_time_keyframe", seek_ms)
 
     def set_playback_rate(self, rate):
         self.cmd_send("set_playback_rate", rate)

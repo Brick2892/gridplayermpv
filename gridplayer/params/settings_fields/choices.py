@@ -19,8 +19,9 @@ from gridplayer.params.static import (
     CacheMode,
     ColorScheme,
     DropAction,
+    GpuChoice,
     GridMode,
-    HWCropBorderOffset,
+    HardwareDecoding,
     ListEndAction,
     ListFailAction,
     ListUpdate,
@@ -46,6 +47,7 @@ from gridplayer.params.static import (
     VideoDriver,
     VideoEndAction,
     VideoInitialState,
+    VideoQuality,
     VideoTransform,
 )
 from gridplayer.params.subtitle_encodings import SUBTITLE_ENCODINGS
@@ -416,6 +418,7 @@ def color_schemes() -> dict:
         ColorScheme.SYSTEM: translate("SettingsDialog", "System"),
         ColorScheme.LIGHT: translate("SettingsDialog", "Light"),
         ColorScheme.DARK: translate("SettingsDialog", "Dark"),
+        ColorScheme.TRUE_DARK: translate("SettingsDialog", "True Dark"),
     }
 
 
@@ -470,23 +473,13 @@ def video_drivers() -> dict:
     )
 
     # translate() kept out of the f-strings, where pylupdate5 cannot see it
-    vlc_version = f" <VLC {env.VLC_VERSION}>"
+    mpv_version = f" <mpv {env.MPV_VERSION}>"
 
-    drivers = {}
-    if not env.IS_MACOS:
-        drivers[VideoDriver.VLC_HW] = (
-            translate("SettingsDialog", "Hardware") + vlc_version
-        )
-    drivers.update(
-        {
-            VideoDriver.VLC_HW_SP: translate("SettingsDialog", "Hardware SP")
-            + vlc_version,
-            VideoDriver.VLC_SW: translate("SettingsDialog", "Software") + vlc_version,
-            VideoDriver.VLC_SW_SP: translate("SettingsDialog", "Software SP")
-            + vlc_version,
-            VideoDriver.DUMMY: translate("SettingsDialog", "Dummy"),
-        }
-    )
+    drivers = {
+        VideoDriver.MPV_HW: translate("SettingsDialog", "Hardware") + mpv_version,
+        VideoDriver.MPV_SW: translate("SettingsDialog", "Software") + mpv_version,
+        VideoDriver.DUMMY: translate("SettingsDialog", "Dummy"),
+    }
 
     if is_hw_video_available():
         return drivers
@@ -498,16 +491,34 @@ def video_drivers() -> dict:
     }
 
 
-def hw_crop_borders() -> dict:
+def video_qualities() -> dict:
     return {
-        HWCropBorderOffset.AUTO: translate("SettingsDialog", "Auto"),
-        HWCropBorderOffset.DISABLED: translate("SettingsDialog", "Disabled"),
-        HWCropBorderOffset.PX2: translate("SettingsDialog", "2 px"),
-        HWCropBorderOffset.PX4: translate("SettingsDialog", "4 px"),
-        HWCropBorderOffset.PX6: translate("SettingsDialog", "6 px"),
-        HWCropBorderOffset.PX8: translate("SettingsDialog", "8 px"),
-        HWCropBorderOffset.PX10: translate("SettingsDialog", "10 px"),
-        HWCropBorderOffset.PX12: translate("SettingsDialog", "12 px"),
+        VideoQuality.AUTO: translate("SettingsDialog", "Auto"),
+        VideoQuality.FAST: translate("SettingsDialog", "Fast"),
+        VideoQuality.BALANCED: translate("SettingsDialog", "Balanced"),
+        VideoQuality.HIGH: translate("SettingsDialog", "High"),
+        VideoQuality.MAXIMUM: translate("SettingsDialog", "Maximum"),
+    }
+
+
+def gpu_choices() -> dict:
+    """The ways of picking one, then the cards this computer has by name."""
+
+    from gridplayer.utils.gpu_adapters import gpu_adapters
+
+    return {
+        GpuChoice.AUTO: translate("SettingsDialog", "Auto (Windows decides)"),
+        GpuChoice.HIGH_PERFORMANCE: translate("SettingsDialog", "High performance"),
+        GpuChoice.POWER_SAVING: translate("SettingsDialog", "Power saving"),
+        **{adapter.name: adapter.name for adapter in gpu_adapters()},
+    }
+
+
+def hardware_decoding_modes() -> dict:
+    return {
+        HardwareDecoding.AUTO: translate("SettingsDialog", "Auto"),
+        HardwareDecoding.COPY: translate("SettingsDialog", "GPU, copied to memory"),
+        HardwareDecoding.OFF: translate("SettingsDialog", "Off (CPU only)"),
     }
 
 
@@ -515,16 +526,6 @@ def log_levels() -> dict:
     return {
         log_config.DISABLED: translate("ErrorLevel", "None"),
         logging.CRITICAL: translate("ErrorLevel", "Critical"),
-        logging.ERROR: translate("ErrorLevel", "Error"),
-        logging.WARNING: translate("ErrorLevel", "Warning"),
-        logging.INFO: translate("ErrorLevel", "Info"),
-        logging.DEBUG: translate("ErrorLevel", "Debug"),
-    }
-
-
-def vlc_log_levels() -> dict:
-    return {
-        log_config.DISABLED: translate("ErrorLevel", "None"),
         logging.ERROR: translate("ErrorLevel", "Error"),
         logging.WARNING: translate("ErrorLevel", "Warning"),
         logging.INFO: translate("ErrorLevel", "Info"),
